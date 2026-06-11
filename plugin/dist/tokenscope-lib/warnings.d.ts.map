@@ -1,0 +1,1 @@
+{"version":3,"file":"warnings.d.ts","sourceRoot":"","sources":["../../tokenscope-lib/warnings.ts"],"names":[],"mappings":"AAEA,qBAAa,gBAAgB;IAC3B,OAAO,CAAC,QAAQ,CAAC,QAAQ,CAAe;IACxC,OAAO,CAAC,QAAQ,CAAC,IAAI,CAAoB;IAEzC,GAAG,CAAC,OAAO,EAAE,MAAM,EAAE,GAAG,CAAC,EAAE,MAAM,GAAG,IAAI;IAUxC,IAAI,IAAI,MAAM,EAAE;CAGjB;AAED,wBAAgB,kBAAkB,CAAC,KAAK,EAAE,OAAO,GAAG,MAAM,CAczD"}

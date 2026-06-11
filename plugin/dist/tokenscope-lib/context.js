@@ -1,0 +1,593 @@
+// ContextAnalyzer - analyzes context breakdown from opencode export
+import { collectTelemetryCalls, firstCacheWriteTokens, summarizeTelemetry } from "./telemetry.js";
+import { formatErrorMessage } from "./warnings.js";
+import { fetchToolList, unwrapResponseData } from "./opencode.js";
+const defaultExportCommandRunner = async (sessionID, directory) => {
+    const { $ } = await import("bun");
+    // Use .quiet() to capture streams separately, then use only stdout.
+    // This avoids stderr ("Exporting session:") being mixed with JSON.
+    const command = $ `opencode export ${sessionID}`;
+    const { stdout } = await (directory ? command.cwd(directory) : command).quiet();
+    return stdout.toString();
+};
+export class ContextAnalyzer {
+    warnings;
+    client;
+    directory;
+    exportCommandRunner;
+    tokenizerManager;
+    toolTokenCache = new WeakMap();
+    constructor(tokenizerManager, warnings, client, directory, exportCommandRunner = defaultExportCommandRunner) {
+        this.warnings = warnings;
+        this.client = client;
+        this.directory = directory;
+        this.exportCommandRunner = exportCommandRunner;
+        this.tokenizerManager = tokenizerManager;
+    }
+    /**
+     * Main entry point - analyzes a session using opencode export
+     */
+    async analyze(sessionID, tokenModel, pricing, config, providerID, modelID) {
+        const result = {};
+        try {
+            const exported = await this.runExport(sessionID);
+            if (!exported)
+                return result;
+            const shouldFetchToolDefinitions = config.enableContextBreakdown || config.enableToolSchemaEstimation;
+            const cacheWriteModel = this.firstCacheWriteModel(exported);
+            const toolProviderID = cacheWriteModel.providerID ?? providerID;
+            const toolModelID = cacheWriteModel.modelID ?? modelID;
+            const toolDefinitions = shouldFetchToolDefinitions ? await this.getToolDefinitions(toolProviderID, toolModelID) : [];
+            if (toolDefinitions.length > 0) {
+                await this.precomputeToolDefinitionTokens(toolDefinitions, tokenModel);
+            }
+            if (config.enableContextBreakdown) {
+                result.contextBreakdown = await this.analyzeContextBreakdown(exported, tokenModel, toolDefinitions);
+            }
+            if (config.enableToolSchemaEstimation) {
+                result.toolEstimates = await this.estimateToolSchemas(exported, tokenModel, toolDefinitions);
+            }
+            if (config.enableCacheEfficiency) {
+                result.cacheEfficiency = this.calculateCacheEfficiency(exported, pricing);
+            }
+        }
+        catch (error) {
+            this.warnings?.add(`Context analysis was skipped for session ${sessionID}: ${formatErrorMessage(error)}`, `context-analysis:${sessionID}`);
+        }
+        return result;
+    }
+    /**
+     * Execute opencode export and parse the JSON output
+     */
+    async runExport(sessionID) {
+        try {
+            const result = await this.exportCommandRunner(sessionID, this.directory);
+            if (!result.trim()) {
+                this.warnings?.add(`OpenCode export returned no data for session ${sessionID}. Context sections were skipped.`, `export-empty:${sessionID}`);
+                return null;
+            }
+            return JSON.parse(result);
+        }
+        catch (error) {
+            this.warnings?.add(`OpenCode export failed for session ${sessionID}. Context sections were skipped: ${formatErrorMessage(error)}`, `export-failed:${sessionID}`);
+            return null;
+        }
+    }
+    /**
+     * Analyze context breakdown from cache_write tokens.
+     *
+     * Note: OpenCode's `opencode export` command doesn't include system prompt content
+     * in the output, so we estimate the breakdown from the first cache_write token count
+     * which represents the total cached context size.
+     *
+     * If system prompts become available in future versions, we can enhance this
+     * to tokenize the actual content for more accurate breakdowns.
+     */
+    async analyzeContextBreakdown(exported, tokenModel, toolDefinitions) {
+        const breakdown = {
+            baseSystemPrompt: { tokens: 0, identified: false },
+            toolDefinitions: { tokens: 0, identified: false, toolCount: 0 },
+            environmentContext: { tokens: 0, identified: false, components: [] },
+            projectTree: { tokens: 0, identified: false, fileCount: 0 },
+            customInstructions: { tokens: 0, identified: false, sources: [] },
+            totalCachedContext: 0,
+        };
+        // OpenCode currently stores only explicit user-provided system overrides on
+        // messages, not the generated env/instructions/skills/tool prompt array.
+        // Only tokenize exported system content directly if it looks like generated
+        // OpenCode context; otherwise estimate from provider cache_write telemetry.
+        const systemPrompts = this.selectGeneratedSystemPrompts(this.extractSystemPrompts(exported));
+        // If system prompts are available, analyze them directly
+        if (systemPrompts.length > 0) {
+            return this.analyzeSystemPromptContent(exported, tokenModel, systemPrompts, breakdown, toolDefinitions);
+        }
+        // Default: Estimate from cache_write tokens
+        return this.estimateContextFromCacheTokens(exported, breakdown, toolDefinitions);
+    }
+    /**
+     * Analyze actual system prompt content (for when opencode export includes it)
+     */
+    async analyzeSystemPromptContent(exported, tokenModel, systemPrompts, breakdown, toolDefinitions) {
+        for (const prompt of systemPrompts) {
+            const promptLower = prompt.toLowerCase();
+            const tokens = await this.tokenizerManager.countTokens(prompt, tokenModel);
+            // The system prompt typically has multiple parts that may be concatenated.
+            // We need to detect different sections within each prompt string.
+            // Check for environment context with <env> tags
+            if (promptLower.includes("<env>")) {
+                // Extract just the env section tokens
+                const envMatch = prompt.match(/<env>[\s\S]*?<\/env>/i);
+                if (envMatch) {
+                    const envTokens = await this.tokenizerManager.countTokens(envMatch[0], tokenModel);
+                    breakdown.environmentContext.tokens += envTokens;
+                    breakdown.environmentContext.identified = true;
+                    if (promptLower.includes("working directory:")) {
+                        breakdown.environmentContext.components.push("working-dir");
+                    }
+                    if (promptLower.includes("platform:")) {
+                        breakdown.environmentContext.components.push("platform");
+                    }
+                    if (promptLower.includes("git repo")) {
+                        breakdown.environmentContext.components.push("git-status");
+                    }
+                    if (promptLower.includes("date:")) {
+                        breakdown.environmentContext.components.push("date");
+                    }
+                }
+            }
+            // Check for project tree with modern <directories> tags
+            // (fallback to legacy <files> tags)
+            if (promptLower.includes("<directories>") || promptLower.includes("<files>")) {
+                const treeMatch = prompt.match(/<directories>[\s\S]*?<\/directories>/i) ?? prompt.match(/<files>[\s\S]*?<\/files>/i);
+                if (treeMatch) {
+                    const filesTokens = await this.tokenizerManager.countTokens(treeMatch[0], tokenModel);
+                    breakdown.projectTree.tokens += filesTokens;
+                    breakdown.projectTree.identified = true;
+                    breakdown.projectTree.fileCount += this.countProjectTreeEntries(treeMatch[0]);
+                }
+            }
+            // Check for custom instructions
+            if (promptLower.includes("instructions from:") || promptLower.includes("agents.md")) {
+                // Try to extract just the instructions section
+                const instructionMatches = prompt.match(/Instructions from:[\s\S]*?(?=Instructions from:|<env>|<files>|<directories>|$)/gi);
+                if (instructionMatches) {
+                    for (const match of instructionMatches) {
+                        const instrTokens = await this.tokenizerManager.countTokens(match, tokenModel);
+                        breakdown.customInstructions.tokens += instrTokens;
+                        breakdown.customInstructions.identified = true;
+                        // Extract source path
+                        const pathMatch = match.match(/Instructions from:\s*([^\n]+)/i);
+                        if (pathMatch && pathMatch[1]) {
+                            const sourcePath = pathMatch[1].trim();
+                            if (sourcePath && !breakdown.customInstructions.sources.includes(sourcePath)) {
+                                breakdown.customInstructions.sources.push(sourcePath);
+                            }
+                        }
+                    }
+                }
+            }
+            // Tool definitions detection (in <functions> tags)
+            if (promptLower.includes("<functions>") || promptLower.includes('"type": "object"')) {
+                const functionsMatch = prompt.match(/<functions>[\s\S]*?<\/functions>/i);
+                if (functionsMatch) {
+                    const funcTokens = await this.tokenizerManager.countTokens(functionsMatch[0], tokenModel);
+                    breakdown.toolDefinitions.tokens += funcTokens;
+                    breakdown.toolDefinitions.identified = true;
+                    // Count tools from <function> tags
+                    const toolMatches = functionsMatch[0].match(/<function>/g);
+                    if (toolMatches) {
+                        breakdown.toolDefinitions.toolCount += toolMatches.length;
+                    }
+                }
+                else {
+                    // Fallback: count the whole prompt as tool definitions
+                    breakdown.toolDefinitions.tokens += tokens;
+                    breakdown.toolDefinitions.identified = true;
+                }
+            }
+            // Base system prompt detection - the main instructions
+            // This is typically the first/longest part without the special tags
+            if ((promptLower.includes("you are opencode") ||
+                promptLower.includes("you are claude") ||
+                promptLower.includes("you are an") ||
+                promptLower.includes("you are a ") ||
+                (promptLower.includes("assistant") && promptLower.includes("software engineering"))) &&
+                !promptLower.includes("<env>") &&
+                !promptLower.includes("<files>") &&
+                !promptLower.includes("<directories>") &&
+                !promptLower.includes("<functions>")) {
+                breakdown.baseSystemPrompt.tokens += tokens;
+                breakdown.baseSystemPrompt.identified = true;
+            }
+            // If nothing specific matched but it's substantial text, add to base prompt
+            else if (prompt.length > 500 &&
+                !promptLower.includes("<env>") &&
+                !promptLower.includes("<files>") &&
+                !promptLower.includes("<directories>") &&
+                !promptLower.includes("<functions>") &&
+                !promptLower.includes("instructions from:")) {
+                breakdown.baseSystemPrompt.tokens += tokens;
+            }
+        }
+        breakdown.totalCachedContext =
+            breakdown.baseSystemPrompt.tokens +
+                breakdown.toolDefinitions.tokens +
+                breakdown.environmentContext.tokens +
+                breakdown.projectTree.tokens +
+                breakdown.customInstructions.tokens;
+        if (breakdown.toolDefinitions.tokens === 0 && toolDefinitions.length > 0) {
+            breakdown.toolDefinitions.tokens = this.sumPrecomputedToolTokens(toolDefinitions);
+            breakdown.toolDefinitions.toolCount = toolDefinitions.length;
+            breakdown.toolDefinitions.identified = false;
+            breakdown.totalCachedContext += breakdown.toolDefinitions.tokens;
+        }
+        return breakdown;
+    }
+    /**
+     * Extract system prompts from exported session
+     */
+    extractSystemPrompts(exported) {
+        const prompts = new Set();
+        const addPrompt = (value) => {
+            if (Array.isArray(value)) {
+                for (const prompt of value) {
+                    const trimmed = (prompt ?? "").trim();
+                    if (trimmed) {
+                        prompts.add(trimmed);
+                    }
+                }
+                return;
+            }
+            const trimmed = (value ?? "").trim();
+            if (trimmed) {
+                prompts.add(trimmed);
+            }
+        };
+        for (const message of exported.messages) {
+            if (message.info.role === "user" || message.info.role === "assistant") {
+                addPrompt(message.info.system);
+            }
+        }
+        return Array.from(prompts);
+    }
+    countProjectTreeEntries(section) {
+        return section
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0)
+            .filter((line) => !/^<\/?(files|directories)>$/i.test(line)).length;
+    }
+    /**
+     * Estimate context breakdown from cache token counts when system prompts aren't available.
+     *
+     * Based on typical OpenCode system prompt structure:
+     * - Base System Prompt: ~1,500-2,000 tokens
+     * - Tool Definitions: ~350 tokens per tool (typically 12-15 tools = ~4,500-5,500)
+     * - Environment Context: ~100-200 tokens
+     * - Project Tree: ~300-800 tokens (varies by project)
+     * - Custom Instructions: ~100-500 tokens
+     *
+     * We use the first cache_write value as an estimate of total cached context.
+     */
+    estimateContextFromCacheTokens(exported, breakdown, toolDefinitions) {
+        // Find the first API call that wrote to cache to estimate total cached context size
+        const totalCachedTokens = firstCacheWriteTokens(exported.messages);
+        let enabledToolCount = 0;
+        // Count enabled tools from tool calls
+        const enabledTools = this.extractEnabledTools(exported);
+        enabledToolCount = toolDefinitions.length || Object.values(enabledTools).filter(Boolean).length;
+        if (totalCachedTokens === 0) {
+            return breakdown;
+        }
+        const measuredToolTokens = this.sumPrecomputedToolTokens(toolDefinitions);
+        // Prefer current OpenCode /experimental/tool metadata when available; fall
+        // back to a coarse per-tool estimate when only transcript data is present.
+        const estimatedToolTokens = measuredToolTokens || enabledToolCount * 350;
+        breakdown.toolDefinitions.tokens = estimatedToolTokens;
+        breakdown.toolDefinitions.toolCount = enabledToolCount;
+        breakdown.toolDefinitions.identified = false; // Mark as estimated
+        // Estimate environment context (~150 tokens)
+        breakdown.environmentContext.tokens = 150;
+        breakdown.environmentContext.components = ["working-dir", "platform", "git-status", "date"];
+        breakdown.environmentContext.identified = false;
+        // Estimate project tree (~500 tokens average)
+        breakdown.projectTree.tokens = 500;
+        breakdown.projectTree.identified = false;
+        // Remaining tokens go to base system prompt
+        const remainingTokens = totalCachedTokens - estimatedToolTokens - 150 - 500;
+        breakdown.baseSystemPrompt.tokens = Math.max(0, remainingTokens);
+        breakdown.baseSystemPrompt.identified = false;
+        breakdown.totalCachedContext = totalCachedTokens;
+        return breakdown;
+    }
+    /**
+     * Estimate tool schema tokens from tool calls in the session
+     */
+    async estimateToolSchemas(exported, tokenModel, toolDefinitions) {
+        if (toolDefinitions.length > 0) {
+            const estimates = await Promise.all(toolDefinitions.map(async (definition) => {
+                const schema = this.toolSchema(definition);
+                const estimatedTokens = this.toolTokenCache.get(definition) ??
+                    (await this.tokenizerManager.countTokens(this.formatToolDefinition(definition), tokenModel));
+                this.setPrecomputedToolTokens(definition, estimatedTokens);
+                return {
+                    name: definition.id,
+                    enabled: true,
+                    estimatedTokens,
+                    argumentCount: this.countSchemaArguments(schema),
+                    hasComplexArgs: this.hasComplexSchemaArguments(schema),
+                    source: "opencode-api",
+                };
+            }));
+            estimates.sort((a, b) => b.estimatedTokens - a.estimatedTokens);
+            return estimates;
+        }
+        const enabledTools = this.extractEnabledTools(exported);
+        const toolCallData = this.extractToolCallData(exported);
+        const estimates = [];
+        for (const [toolName, enabled] of Object.entries(enabledTools)) {
+            const callData = toolCallData.get(toolName);
+            const estimate = this.estimateToolTokens(toolName, callData);
+            estimates.push({
+                name: toolName,
+                enabled,
+                estimatedTokens: estimate.tokens,
+                argumentCount: estimate.argCount,
+                hasComplexArgs: estimate.hasComplex,
+                source: "transcript",
+            });
+        }
+        // Sort by estimated tokens descending
+        estimates.sort((a, b) => b.estimatedTokens - a.estimatedTokens);
+        return estimates;
+    }
+    async getToolDefinitions(providerID, modelID) {
+        if (!this.client || !providerID || !modelID) {
+            return [];
+        }
+        try {
+            const response = await fetchToolList(this.client, providerID, modelID, { directory: this.directory });
+            const tools = unwrapResponseData(response ?? []);
+            return Array.isArray(tools) ? tools.filter((tool) => typeof tool?.id === "string") : [];
+        }
+        catch (error) {
+            this.warnings?.add(`Could not fetch tool definitions for ${providerID}/${modelID}. Tool schema sizes use transcript-based estimates: ${formatErrorMessage(error)}`, `context-tool-list:${providerID}:${modelID}`);
+            return [];
+        }
+    }
+    selectGeneratedSystemPrompts(prompts) {
+        const strongPrompts = prompts.filter((prompt) => this.isStrongGeneratedSystemContext(prompt));
+        const hasBasePrompt = prompts.some((prompt) => this.isBaseGeneratedSystemPrompt(prompt));
+        if (strongPrompts.length === 0 || (strongPrompts.length === 1 && !hasBasePrompt)) {
+            return [];
+        }
+        return prompts.filter((prompt) => this.isStrongGeneratedSystemContext(prompt) || this.isBaseGeneratedSystemPrompt(prompt) || this.isInstructionPrompt(prompt));
+    }
+    isStrongGeneratedSystemContext(prompt) {
+        const lower = prompt.toLowerCase();
+        return (/<env>[\s\S]*?<\/env>/i.test(prompt) ||
+            /<available_skills>[\s\S]*?<\/available_skills>/i.test(prompt) ||
+            /<functions>[\s\S]*?<\/functions>/i.test(prompt) ||
+            (/^instructions from:\s*.+/im.test(prompt) &&
+                (lower.includes("agents.md") ||
+                    lower.includes("claude.md") ||
+                    lower.includes("context.md") ||
+                    lower.includes("opencode"))) ||
+            lower.includes("available agent types and the tools they have access to") ||
+            lower.includes("skills provide specialized instructions and workflows"));
+    }
+    isBaseGeneratedSystemPrompt(prompt) {
+        const lower = prompt.toLowerCase();
+        return (lower.includes("you are opencode") ||
+            (prompt.length > 500 && lower.includes("assistant") && lower.includes("software engineering")));
+    }
+    isInstructionPrompt(prompt) {
+        return /^instructions from:\s*.+/im.test(prompt);
+    }
+    toolSchema(tool) {
+        return tool.jsonSchema ?? tool.parameters;
+    }
+    formatToolDefinition(tool) {
+        const schema = this.toolSchema(tool);
+        return [
+            `<tool name="${tool.id}">`,
+            tool.description ? `<description>\n${tool.description}\n</description>` : undefined,
+            schema ? `<schema>\n${JSON.stringify(schema, null, 2)}\n</schema>` : undefined,
+            `</tool>`,
+        ]
+            .filter(Boolean)
+            .join("\n");
+    }
+    countSchemaArguments(schema) {
+        if (!schema || typeof schema !== "object") {
+            return 0;
+        }
+        const properties = schema.properties;
+        return properties && typeof properties === "object" ? Object.keys(properties).length : 0;
+    }
+    hasComplexSchemaArguments(schema) {
+        if (!schema || typeof schema !== "object") {
+            return false;
+        }
+        const properties = schema.properties;
+        if (!properties || typeof properties !== "object") {
+            return false;
+        }
+        return Object.values(properties).some((property) => {
+            if (!property || typeof property !== "object")
+                return false;
+            const type = property.type;
+            return type === "array" || type === "object" || !!property.properties || !!property.items;
+        });
+    }
+    sumPrecomputedToolTokens(tools) {
+        return tools.reduce((sum, tool) => sum + (this.toolTokenCache.get(tool) ?? 0), 0);
+    }
+    setPrecomputedToolTokens(tool, tokens) {
+        this.toolTokenCache.set(tool, tokens);
+    }
+    async precomputeToolDefinitionTokens(tools, tokenModel) {
+        await Promise.all(tools.map(async (tool) => {
+            if (this.toolTokenCache.has(tool)) {
+                return;
+            }
+            this.setPrecomputedToolTokens(tool, await this.tokenizerManager.countTokens(this.formatToolDefinition(tool), tokenModel));
+        }));
+    }
+    extractTranscriptTools(exported) {
+        const tools = {};
+        for (const message of exported.messages) {
+            for (const part of message.parts) {
+                if (part.type === "tool" && part.tool) {
+                    tools[part.tool] = true;
+                }
+            }
+        }
+        if (Object.keys(tools).length === 0) {
+            for (const message of exported.messages) {
+                if (!message.info.tools)
+                    continue;
+                for (const [name, enabled] of Object.entries(message.info.tools)) {
+                    if (enabled)
+                        tools[name] = true;
+                }
+            }
+        }
+        return tools;
+    }
+    firstCacheWriteModel(exported) {
+        const call = collectTelemetryCalls(exported.messages).find((item) => item.cacheWriteTokens > 0);
+        return { providerID: call?.providerID, modelID: call?.modelID };
+    }
+    /**
+     * Extract enabled tools from user messages
+     */
+    extractEnabledTools(exported) {
+        return this.extractTranscriptTools(exported);
+    }
+    /**
+     * Extract tool call argument data for inference
+     */
+    extractToolCallData(exported) {
+        const data = new Map();
+        for (const message of exported.messages) {
+            for (const part of message.parts) {
+                if (part.type === "tool" && part.tool && part.state?.input) {
+                    const toolName = part.tool;
+                    const existing = data.get(toolName) || [];
+                    existing.push({
+                        argNames: Object.keys(part.state.input),
+                        argTypes: this.inferArgTypes(part.state.input),
+                    });
+                    data.set(toolName, existing);
+                }
+            }
+        }
+        return data;
+    }
+    /**
+     * Infer argument types from values
+     */
+    inferArgTypes(input) {
+        const types = {};
+        for (const [key, value] of Object.entries(input)) {
+            if (Array.isArray(value)) {
+                types[key] = "array";
+            }
+            else if (typeof value === "object" && value !== null) {
+                types[key] = "object";
+            }
+            else if (typeof value === "number") {
+                types[key] = "number";
+            }
+            else if (typeof value === "boolean") {
+                types[key] = "boolean";
+            }
+            else {
+                types[key] = "string";
+            }
+        }
+        return types;
+    }
+    /**
+     * Estimate tokens for a tool schema based on call data
+     *
+     * Formula from plan:
+     * base_tokens = 200  (description + schema overhead)
+     * per_simple_arg = 30
+     * per_complex_arg = 60  (arrays, objects)
+     * description_bonus = 80 (simple) or 120 (complex)
+     */
+    estimateToolTokens(toolName, callData) {
+        const BASE_TOKENS = 200;
+        const PER_SIMPLE_ARG = 30;
+        const PER_COMPLEX_ARG = 60;
+        const SIMPLE_DESCRIPTION_BONUS = 80;
+        const COMPLEX_DESCRIPTION_BONUS = 120;
+        // If no call data, use conservative defaults
+        if (!callData || callData.length === 0) {
+            return {
+                tokens: BASE_TOKENS + 3 * PER_SIMPLE_ARG + PER_COMPLEX_ARG + SIMPLE_DESCRIPTION_BONUS,
+                argCount: 3,
+                hasComplex: true,
+            };
+        }
+        // Aggregate argument info from all calls
+        const allArgNames = new Set();
+        const complexArgs = new Set();
+        for (const call of callData) {
+            for (const name of call.argNames) {
+                allArgNames.add(name);
+            }
+            for (const [name, type] of Object.entries(call.argTypes)) {
+                if (type === "array" || type === "object") {
+                    complexArgs.add(name);
+                }
+            }
+        }
+        const argCount = allArgNames.size;
+        const simpleArgCount = argCount - complexArgs.size;
+        const complexArgCount = complexArgs.size;
+        const hasComplex = complexArgCount > 0;
+        const descBonus = hasComplex ? COMPLEX_DESCRIPTION_BONUS : SIMPLE_DESCRIPTION_BONUS;
+        const tokens = BASE_TOKENS + simpleArgCount * PER_SIMPLE_ARG + complexArgCount * PER_COMPLEX_ARG + descBonus;
+        return { tokens, argCount, hasComplex };
+    }
+    /**
+     * Calculate cache efficiency metrics
+     */
+    calculateCacheEfficiency(exported, pricing) {
+        const telemetry = summarizeTelemetry(exported.messages);
+        const totalCacheRead = telemetry.cacheReadTokens;
+        const totalFreshInput = telemetry.inputTokens;
+        const totalCacheWrite = telemetry.cacheWriteTokens;
+        const totalInputTokens = totalCacheRead + totalFreshInput + totalCacheWrite;
+        const cacheableInputTokens = totalCacheRead + totalFreshInput;
+        // Cache hit rate (read-hit ratio over cacheable input)
+        const cacheHitRate = cacheableInputTokens > 0 ? (totalCacheRead / cacheableInputTokens) * 100 : 0;
+        // Cost calculations
+        const costWithoutCaching = (totalInputTokens / 1_000_000) * pricing.input;
+        const costWithCaching = (totalFreshInput / 1_000_000) * pricing.input +
+            (totalCacheRead / 1_000_000) * pricing.cacheRead +
+            (totalCacheWrite / 1_000_000) * pricing.cacheWrite;
+        const costSavings = costWithoutCaching - costWithCaching;
+        const savingsPercent = costWithoutCaching > 0 ? (costSavings / costWithoutCaching) * 100 : 0;
+        // Effective rate (what you're actually paying per token)
+        const effectiveRate = totalInputTokens > 0 ? (costWithCaching / totalInputTokens) * 1_000_000 : 0;
+        const standardRate = pricing.input;
+        return {
+            cacheReadTokens: totalCacheRead,
+            freshInputTokens: totalFreshInput,
+            cacheWriteTokens: totalCacheWrite,
+            totalInputTokens,
+            cacheHitRate,
+            costWithoutCaching,
+            costWithCaching,
+            costSavings,
+            savingsPercent,
+            effectiveRate,
+            standardRate,
+        };
+    }
+}
+//# sourceMappingURL=context.js.map
